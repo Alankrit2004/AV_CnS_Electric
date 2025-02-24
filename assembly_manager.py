@@ -4,11 +4,16 @@ import json
 def store_craftable_non_craftable_goods(connection, craftable_goods, non_craftable_goods):
     with connection.cursor() as cursor:
         for fg_code, max_units in craftable_goods:
-            cursor.execute("""
-            INSERT INTO crafted_goods (bom_number, "On_hand_Qty", is_active)
-            VALUES (%s, %s, TRUE)
-            ON CONFLICT (bom_number) DO UPDATE SET "On_hand_Qty" = EXCLUDED."On_hand_Qty", is_active = EXCLUDED.is_active;
-            """, (fg_code, max_units))
+            try:
+                max_units_int = int(max_units)  # Ensure max_units is an integer
+                cursor.execute("""
+                INSERT INTO crafted_goods (bom_number, "On_hand_Qty", is_active)
+                VALUES (%s, %s, TRUE)
+                ON CONFLICT (bom_number) DO UPDATE SET "On_hand_Qty" = EXCLUDED."On_hand_Qty", is_active = EXCLUDED.is_active;
+                """, (fg_code, max_units_int))
+            except ValueError as e:
+                print(f"Error converting max_units to int for {fg_code}: {max_units} - {e}")
+                continue
 
         for fg_code, missing_items in non_craftable_goods:
             cursor.execute("""

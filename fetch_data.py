@@ -43,88 +43,94 @@ def fetch_bom_data(connection, finished_good_code):
         print(f"Error fetching BOM data: {e}")
         return []
 
+from collections import defaultdict
+
 def build_bom_tree(bom_data, finished_good_code):
-    """
-    Builds a hierarchical BOM tree based on Item Level.
-    Ensures each item is assigned to the correct parent.
-    """
-    item_data = {row["Item_code"]: row for row in bom_data}  # Store item details
-    tree = defaultdict(list)  # Initialize tree structure
-    parent_map = {}  # Maps items to their correct parent
+    print(f"Input BOM data for {finished_good_code}: {bom_data}")
+    
+    item_data = {row["Item_code"]: row for row in bom_data}
+    print(f"Initial item_data: {item_data}")
+    
+    tree = defaultdict(list)
+    parent_stack = []  
+   
+    if finished_good_code not in item_data:
+        print(f"Creating default entry for {finished_good_code}")
+        item_data[finished_good_code] = {
+            "On_hand_Qty": 0,
+            "Extended_Quantity": 1,  
+            "Type": "finished_good",
+            "Item_Level": 0
+        }
+        # print(f"Updated item_data with default entry: {item_data}")
 
-    # Sort by Item Level (ensures parents are processed before children)
-    sorted_bom = sorted(bom_data, key=lambda x: x["Item_Level"])  
-
-    for row in sorted_bom:
+    for row in bom_data:
         item_code = row["Item_code"]
-        parent_code = row["Code"]  # Always the finished good code
+        level = row["Item_Level"]
 
+        
+        while parent_stack and parent_stack[-1][1] >= level:
+            parent_stack.pop()
+
+        
+        if parent_stack:
+            parent = parent_stack[-1][0]
+            tree[parent].append(item_code)
+
+        
+        parent_stack.append((item_code, level))
+
+    # Add all Level 1 items as children of the finished good code
+    for row in bom_data:
         if row["Item_Level"] == 1:
-            # Direct child of the finished good (root node)
-            tree[finished_good_code].append(item_code)
-        else:
-            # Assign the correct parent from parent_map
-            if parent_code in tree:
-                tree[parent_code].append(item_code)
-            else:
-                # If the parent is not yet in the tree, store it in parent_map
-                parent_map[item_code] = parent_code
+            tree[finished_good_code].append(row["Item_code"])
 
     return item_data, tree
 
+
+
 def calculate_max_units(tree, item_data, finished_good_code, required_quantity):
-    shortages = []  # Track items causing shortages
+    shortages = []  # List of missing items
+    visited = set()  # Prevents infinite loops
 
     def recursive_calculate(item_code, quantity_needed):
+        if item_code in visited:
+            return 0  # Avoid infinite loops
+
+        visited.add(item_code)
+
         if item_code not in item_data:
             shortages.append((item_code, "Unknown"))
             return 0
 
         item = item_data[item_code]
-        on_hand_qty = float(item.get("On_hand_Qty", 0))  
-        required_qty = max(1, float(item.get("Extended_Quantity", 1)))  
-        item_type = item["Type"].lower()
+        on_hand_qty = float(item["On_hand_Qty"]) if item["On_hand_Qty"] else 0
+        required_qty = max(1, float(item["Extended_Quantity"]))
 
-        print(f"Processing '{item_code}' (Type: {item_type}) - Needed: {quantity_needed}, Available: {on_hand_qty}")
-
-        # ✅ If enough stock is available, return the max craftable units & STOP traversing
+        # ✅ If stock is available, no need to check further
         if on_hand_qty >= quantity_needed:
-            max_units = on_hand_qty // required_qty
-            print(f" '{item_code}' has enough stock ({on_hand_qty}). No need to traverse further.")
-            return max_units
-
-        # 🚨 If purchased item is missing, mark as non-craftable immediately
-        if item_type == "purchased item":
-            if quantity_needed > on_hand_qty:
-                shortages.append((item_code, quantity_needed - on_hand_qty))
-                print(f" '{item_code}' is missing! Shortage: {quantity_needed - on_hand_qty}")
-                return 0
             return on_hand_qty // required_qty
 
-        # ✅ If stock is insufficient, check child items
+        # ✅ If the item has children, check if we can produce it
         if item_code in tree:
             child_units = []
             for child in tree[item_code]:
-                child_needed = quantity_needed * float(item_data[child]["Extended_Quantity"])
-                child_max_units = recursive_calculate(child, child_needed)
+                child_quantity_needed = quantity_needed * float(item_data[child]["Extended_Quantity"])
+                units = recursive_calculate(child, child_quantity_needed)
+                if units == 0:
+                    shortages.append((child, child_quantity_needed))  # Missing child
+                    return 0  # If any required child is missing, crafting fails
+                child_units.append(units)
 
-                if child_max_units == 0:
-                    print(f" '{item_code}' cannot be crafted. Missing child: {child}")
-                    return 0
+            return min(child_units) if child_units else 0
 
-                child_units.append(child_max_units // float(item_data[child]["Extended_Quantity"]))
-
-            max_units_from_children = min(child_units) if child_units else 0
-            print(f"🔹 '{item_code}' can be crafted up to {max_units_from_children} units based on child availability.")
-            return max_units_from_children
-
-        # 🚨 If no stock & no children, mark as missing
+        # ✅ If it has NO children and NO stock, it's truly missing
         shortages.append((item_code, quantity_needed - on_hand_qty))
-        print(f" '{item_code}' is completely missing. Cannot proceed.")
         return 0
 
     max_units = recursive_calculate(finished_good_code, required_quantity)
     return max_units, shortages
+
 
 
 # def calculate_max_units(tree, item_data, finished_good_code, required_quantity):

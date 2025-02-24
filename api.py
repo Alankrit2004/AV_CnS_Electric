@@ -130,62 +130,68 @@ def get_craftable_goods():
 
         cursor = connection.cursor(cursor_factory=RealDictCursor)
         
-        # ✅ Fetch all finished goods without unnecessary limits
         cursor.execute('''
-            SELECT DISTINCT "bom_number" FROM "admin_parts"
+            SELECT DISTINCT "bom_number" 
+            FROM "admin_parts" 
+            LIMIT 10
         ''')
+        
         batch_codes = [row['bom_number'] for row in cursor.fetchall()]
         cursor.close()
-
+        
         craftable_goods = []
         non_craftable_goods = []
-
+        
         for fg_code in batch_codes:
             def process_code():
                 bom_data = fetch_bom_data(connection, fg_code)
                 if not bom_data:
+                    print(f"No BOM data found for {fg_code}")
                     return None
                 
-                # ✅ Build BOM tree correctly
                 item_data, tree = build_bom_tree(bom_data, fg_code)
-
-                # 🔍 Debugging - Check tree structure
-                print(f"\n🔍 Processing {fg_code}")
-                print(f"📌 BOM Tree: {tree}")
-                print(f"📌 Item Data: {item_data}")
-
                 max_units, shortages = calculate_max_units(tree, item_data, fg_code, 1)
                 
                 return (max_units, shortages)
-
-            # ✅ Increase timeout to avoid missing deep BOM structures
-            status, result = run_with_timeout(process_code, timeout=10)
-
+            
+            status, result = run_with_timeout(process_code, timeout=5)
+            
             if status == 'timeout':
-                print(f"⏳ Timeout processing {fg_code} - Increase timeout if needed")
+                print(f"Timeout processing {fg_code}")
                 continue
             elif status == 'error':
-                print(f"❌ Error processing {fg_code}: {result}")
+                print(f"Error processing finished good {fg_code}: {result}")
                 continue
             elif status == 'success' and result:
                 max_units, shortages = result
-                
                 if shortages:
                     missing_items = [item[0] for item in shortages]
-                    non_craftable_goods.append({"finished_good_code": fg_code, "missing_items": missing_items})
+                    non_craftable_goods.append((fg_code, missing_items))
                 elif max_units > 0:
-                    craftable_goods.append({"finished_good_code": fg_code, "max_units": max_units})
-
-        # ✅ Store in database
+                    craftable_goods.append((fg_code, max_units))
+        
+        # Store the results in the database
+        print(f"Craftable goods: {craftable_goods}")
+        print(f"Non-craftable goods: {non_craftable_goods}")
         store_craftable_non_craftable_goods(connection, craftable_goods, non_craftable_goods)
-
+        
+        response_craftable = [
+            {"finished_good_code": fg_code, "max_units": max_units}
+            for fg_code, max_units in craftable_goods
+        ]
+        
+        response_non_craftable = [
+            {"finished_good_code": fg_code, "missing_items": missing_items}
+            for fg_code, missing_items in non_craftable_goods
+        ]
+        
         return jsonify({
-            "craftable_goods": craftable_goods,
-            "non_craftable_goods": non_craftable_goods
+            "craftable_goods": response_craftable,
+            "non_craftable_goods": response_non_craftable
         })
    
     except Exception as e:
-        print(f"❌ Error in get_craftable_goods: {str(e)}")
+        print(f"Error in get_craftable_goods: {str(e)}")
         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
    
     finally:
