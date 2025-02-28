@@ -43,7 +43,7 @@ def assemble_finished_good(connection, finished_good_code, quantity, confirm=Fal
 
     with connection.cursor() as cursor:
         for new_qty, item_code in updates:
-            cursor.execute('UPDATE admin_parts SET "On_hand_Qty" = %s WHERE "Item_code" = %s;', (new_qty, item_code))
+            cursor.execute('UPDATE admin_parts_duplicate SET "On_hand_Qty" = %s WHERE "Item_code" = %s;', (new_qty, item_code))
         connection.commit()
 
     return {"success": True, "message": f"{quantity} units of {finished_good_code} assembled."}

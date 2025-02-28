@@ -11,6 +11,7 @@ from fetch_data import build_bom_tree, calculate_max_units
 from threading import Thread
 from queue import Queue
 from datetime import datetime, timedelta, timezone
+import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -132,7 +133,7 @@ def get_craftable_goods():
         
         cursor.execute('''
             SELECT DISTINCT "bom_number" 
-            FROM "admin_parts" 
+            FROM "admin_parts_duplicate" 
             LIMIT 10
         ''')
         
@@ -173,7 +174,7 @@ def get_craftable_goods():
         # Store the results in the database
         print(f"Craftable goods: {craftable_goods}")
         print(f"Non-craftable goods: {non_craftable_goods}")
-        store_craftable_non_craftable_goods(connection, craftable_goods, non_craftable_goods)
+        # store_craftable_non_craftable_goods(connection, craftable_goods, non_craftable_goods)
         
         response_craftable = [
             {"finished_good_code": fg_code, "max_units": max_units}
@@ -221,20 +222,147 @@ def timeout(seconds):
         # Cancel the alarm
         signal.alarm(0)
 
+# ✅ **Assemble Finished Goods API (Now with Logging!)**
+# @app.route("/assemble", methods=["POST"])
+# @jwt_required()
+# def assemble():
+#     try:
+#         data = request.get_json()
+#         print(f"Received data: {data}")  # Debugging
+        
+#         finished_good_code = data.get("finished_good_code")
+#         quantity = data.get("quantity")
+#         confirm = data.get("confirm", False)
+#         user = get_jwt_identity()  # Fetch the logged-in user
 
-# ✅ **Assemble Finished Goods API**
+#         print(f"Parsed values - code: {finished_good_code}, quantity: {quantity}, confirm: {confirm}, user: {user}")  # Debugging
+        
+#         if not finished_good_code or not isinstance(quantity, int) or quantity <= 0:
+#             return jsonify({"error": "Invalid input data"}), 400
+            
+#         connection = connect_to_database()
+#         if not connection:
+#             return jsonify({"error": "Database connection failed"}), 500
+            
+#         # Call the function to assemble the item
+#         result = assemble_finished_good(
+#             connection=connection,
+#             finished_good_code=finished_good_code,
+#             quantity=quantity,
+#             confirm=confirm
+#         )
+        
+#         print(f"Function result: {result}")  # Debugging
+        
+#         if result["success"]:
+#             try:
+#                 cursor = connection.cursor()
+
+#                 # ✅ **Log the assembly action**
+#                 cursor.execute("""
+#                     INSERT INTO assembly_logs (bom_number, max_crafted_units, created_by, created_at)
+#                     VALUES (%s, %s, %s, NOW());
+#                 """, (finished_good_code, quantity, user))
+
+#                 # ✅ **Delete the assembled bom_number from crafted_goods**
+#                 cursor.execute("""
+#                     DELETE FROM crafted_goods WHERE bom_number = %s;
+#                 """, (finished_good_code,))
+
+#                 connection.commit()
+#                 cursor.close()
+#             except Exception as log_error:
+#                 print(f"⚠️ Error logging assembly or deleting crafted item: {log_error}")
+
+#             connection.close()
+#             return jsonify({"message": result["message"]}), 200
+#         else:
+#             connection.close()
+#             return jsonify({"error": result["message"], "details": result}), 400
+            
+#     except Exception as e:
+#         print(f"API error: {str(e)}")  # Debugging
+#         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+# @app.route("/assemble", methods=["POST"])
+# @jwt_required()
+# def assemble():
+#     try:
+#         data = request.get_json()
+#         print(f"Received data: {data}")  # Debugging
+        
+#         finished_good_code = data.get("finished_good_code")
+#         quantity = data.get("quantity")
+#         confirm = data.get("confirm", False)
+#         user = get_jwt_identity()  # Fetch the logged-in user
+
+#         print(f"Parsed values - code: {finished_good_code}, quantity: {quantity}, confirm: {confirm}, user: {user}")  # Debugging
+        
+#         if not finished_good_code or not isinstance(quantity, int) or quantity <= 0:
+#             return jsonify({"error": "Invalid input data"}), 400
+            
+#         connection = connect_to_database()
+#         if not connection:
+#             return jsonify({"error": "Database connection failed"}), 500
+        
+#         # ✅ **Run database operations in a separate thread**
+#         def process_assembly():
+#             try:
+#                 result = assemble_finished_good(
+#                     connection=connection,
+#                     finished_good_code=finished_good_code,
+#                     quantity=quantity,
+#                     confirm=confirm
+#                 )
+
+#                 if result["success"]:
+#                     cursor = connection.cursor()
+                    
+#                     # ✅ **Log the assembly action**
+#                     cursor.execute("""
+#                         INSERT INTO assembly_logs (bom_number, max_crafted_units, created_by, created_at)
+#                         VALUES (%s, %s, %s, NOW());
+#                     """, (finished_good_code, quantity, user))
+
+#                     # ✅ **Delete the assembled bom_number from crafted_goods**
+#                     cursor.execute("""
+#                         DELETE FROM crafted_goods WHERE bom_number = %s;
+#                     """, (finished_good_code,))
+
+#                     connection.commit()
+#                     cursor.close()
+#                     print(f"✅ Assembly process completed for {finished_good_code}")
+
+#             except Exception as log_error:
+#                 print(f"⚠️ Error processing assembly in background: {log_error}")
+#             finally:
+#                 connection.close()
+
+#         # Start the background process
+#         thread = threading.Thread(target=process_assembly)
+#         thread.start()
+
+#         # ✅ **Return success immediately**
+#         return jsonify({"message": "Assembly process started successfully! Changes will be reflected shortly."}), 202
+
+#     except Exception as e:
+#         print(f"API error: {str(e)}")  # Debugging
+#         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+
 @app.route("/assemble", methods=["POST"])
 @jwt_required()
 def assemble():
     try:
         data = request.get_json()
-        print(f"Received data: {data}")  # Debug line
+        print(f"Received data: {data}")  # Debugging
         
         finished_good_code = data.get("finished_good_code")
         quantity = data.get("quantity")
         confirm = data.get("confirm", False)
-        
-        print(f"Parsed values - code: {finished_good_code}, quantity: {quantity}, confirm: {confirm}")  # Debug line
+        user = get_jwt_identity()  # Fetch the logged-in user
+
+        print(f"Parsed values - code: {finished_good_code}, quantity: {quantity}, confirm: {confirm}, user: {user}")  # Debugging
         
         if not finished_good_code or not isinstance(quantity, int) or quantity <= 0:
             return jsonify({"error": "Invalid input data"}), 400
@@ -242,26 +370,177 @@ def assemble():
         connection = connect_to_database()
         if not connection:
             return jsonify({"error": "Database connection failed"}), 500
-            
-        result = assemble_finished_good(
-            connection=connection,
-            finished_good_code=finished_good_code,
-            quantity=quantity,
-            confirm=confirm
-        )
         
-        print(f"Function result: {result}")  # Debug line
+        # ✅ **Run database operations in a separate thread**
+        def process_assembly():
+            try:
+                result = assemble_finished_good(
+                    connection=connection,
+                    finished_good_code=finished_good_code,
+                    quantity=quantity,
+                    confirm=confirm
+                )
+
+                if result["success"]:
+                    cursor = connection.cursor()
+                    
+                    # ✅ **Log the assembly action**
+                    cursor.execute("""
+                        INSERT INTO assembly_logs (bom_number, max_crafted_units, created_by, created_at)
+                        VALUES (%s, %s, %s, NOW());
+                    """, (finished_good_code, quantity, user))
+
+                    # ✅ **Delete the assembled bom_number from crafted_goods**
+                    cursor.execute("""
+                        DELETE FROM crafted_goods WHERE bom_number = %s;
+                    """, (finished_good_code,))
+
+                    connection.commit()
+                    cursor.close()
+                    print(f"✅ Successfully assembled {finished_good_code} in {quantity} quantity!")
+
+            except Exception as log_error:
+                print(f"⚠️ Error processing assembly in background: {log_error}")
+            finally:
+                connection.close()
+
+        # Start the background process
+        thread = threading.Thread(target=process_assembly)
+        thread.start()
+
+        # ✅ **Return success immediately**
+        return jsonify({
+            "message": f" Successfully assembled {finished_good_code} in {quantity} quantity!"
+        }), 202
+
+    except Exception as e:
+        print(f"API error: {str(e)}")  # Debugging
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+
+# ✅ **List Assembly Logs with Search & Pagination**
+@app.route("/assembly_logs", methods=["POST"])
+@jwt_required()
+def list_assembly_logs():
+    try:
+        data = request.get_json()
+        search_text = data.get("search_text", "").strip()
+        page = data.get("page", 1)  # Default page is 1
+        page_size = data.get("page_size", 10)  # Default page size is 10
         
+        # Validate pagination values
+        if not isinstance(page, int) or page <= 0:
+            return jsonify({"error": "Invalid page number"}), 400
+        if not isinstance(page_size, int) or page_size <= 0:
+            return jsonify({"error": "Invalid page size"}), 400
+        
+        offset = (page - 1) * page_size  # Calculate offset for pagination
+        
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+        
+        cursor = connection.cursor()
+        
+        # Base query
+        query = "SELECT id, bom_number, max_crafted_units, created_by, created_at FROM assembly_logs"
+        params = []
+        
+        # Apply search filter if provided
+        if search_text:
+            query += " WHERE bom_number ILIKE %s OR created_by ILIKE %s"
+            params.extend([f"%{search_text}%", f"%{search_text}%"])
+        
+        # Add pagination
+        query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+        params.extend([page_size, offset])
+        
+        cursor.execute(query, tuple(params))
+        logs = cursor.fetchall()
+        cursor.close()
         connection.close()
         
-        if result["success"]:
-            return jsonify({"message": result["message"]}), 200
-        else:
-            return jsonify({"error": result["message"], "details": result}), 400
-            
+        return jsonify({"assembly_logs": logs, "page": page, "page_size": page_size}), 200
+    
     except Exception as e:
-        print(f"API error: {str(e)}")  # Debug line
+        print(f"API error: {str(e)}")
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+
+@app.route("/plan_crafted_good", methods=["POST"])
+@jwt_required()
+def plan_craftable_good():
+    """
+    Stores the selected craftable good in the crafted_goods table.
+    """
+    data = request.get_json()
+    bom_number = data.get("bom_number")
+
+    if not bom_number:
+        return jsonify({"error": "BOM number is required."}), 400
+
+    try:
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor()
+
+        # Insert bom_number only; Type & Approved get default values
+        cursor.execute("""
+            INSERT INTO crafted_goods (bom_number)
+            VALUES (%s)
+            ON CONFLICT (bom_number) DO NOTHING;
+        """, (bom_number,))
+        
+        connection.commit()
+        cursor.close()
+        return jsonify({"message": f"BOM number {bom_number} planned successfully."})
+    
+    except Exception as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
+
+
+# # ✅ **Assemble Finished Goods API**
+# @app.route("/assemble", methods=["POST"])
+# @jwt_required()
+# def assemble():
+#     try:
+#         data = request.get_json()
+#         print(f"Received data: {data}")  # Debug line
+        
+#         finished_good_code = data.get("finished_good_code")
+#         quantity = data.get("quantity")
+#         confirm = data.get("confirm", False)
+        
+#         print(f"Parsed values - code: {finished_good_code}, quantity: {quantity}, confirm: {confirm}")  # Debug line
+        
+#         if not finished_good_code or not isinstance(quantity, int) or quantity <= 0:
+#             return jsonify({"error": "Invalid input data"}), 400
+            
+#         connection = connect_to_database()
+#         if not connection:
+#             return jsonify({"error": "Database connection failed"}), 500
+            
+#         result = assemble_finished_good(
+#             connection=connection,
+#             finished_good_code=finished_good_code,
+#             quantity=quantity,
+#             confirm=confirm
+#         )
+        
+#         print(f"Function result: {result}")  # Debug line
+        
+#         connection.close()
+        
+#         if result["success"]:
+#             return jsonify({"message": result["message"]}), 200
+#         else:
+#             return jsonify({"error": result["message"], "details": result}), 400
+            
+#     except Exception as e:
+#         print(f"API error: {str(e)}")  # Debug line
+#         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route("/admin_parts", methods=["POST"])
 @jwt_required()
