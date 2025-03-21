@@ -936,6 +936,53 @@ def download_planned_inventory():
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
 
+@app.route("/download_bom_data", methods=["POST"])
+@jwt_required()
+def download_bom_data():
+    """
+    Download BOM data before or after planning.
+    - If `bom_number` is provided, fetch data for that specific BOM.
+    - If no `bom_number` is provided, fetch the entire table.
+    """
+    try:
+        data = request.get_json()
+        bom_number = data.get("bom_number")  # Optional
+
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+
+        if bom_number:
+            # Fetch specific BOM data
+            cursor.execute("""
+                SELECT * FROM admin_parts WHERE bom_number = %s
+            """, (bom_number,))
+        else:
+            # Fetch entire BOM data
+            cursor.execute("SELECT * FROM admin_parts")
+
+        bom_data = cursor.fetchall()
+        cursor.close()
+
+        if not bom_data:
+            return jsonify({"error": "No data found"}), 404
+
+        # Convert to DataFrame
+        df = pd.DataFrame(bom_data)
+
+        # Create Excel file
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="BOM Data")
+
+        output.seek(0)
+
+        return send_file(output, as_attachment=True, download_name="BOM_Data.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
 
 
         
