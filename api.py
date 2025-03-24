@@ -304,7 +304,7 @@ def timeout(seconds):
         # Cancel the alarm
         signal.alarm(0)
 
-
+     
 @app.route("/assemble", methods=["POST"])
 @jwt_required()
 def assemble():
@@ -314,11 +314,11 @@ def assemble():
     """
     try:
         data = request.get_json()
-        bom_number = data.get("bom_number")
+        finished_good_code = data.get("finished_good_code")
         quantity = data.get("quantity")
         user = get_jwt_identity()
 
-        if not bom_number or not isinstance(quantity, int) or quantity <= 0:
+        if not finished_good_code or not isinstance(quantity, int) or quantity <= 0:
             return jsonify({"error": "Valid BOM number and quantity required."}), 400
 
         connection = connect_to_database()
@@ -327,41 +327,29 @@ def assemble():
 
         cursor = connection.cursor()
 
-        # 🚀 **1. Permanently Deduct Inventory**
-        cursor.execute("""
-            UPDATE admin_parts
-            SET "On_hand_Qty" = "On_hand_Qty" - sub.deduct_qty
-            FROM (
-                SELECT "Item_code", SUM("On_hand_Qty") AS deduct_qty
-                FROM planned_inventory
-                WHERE bom_number = %s
-                GROUP BY "Item_code"
-            ) AS sub
-            WHERE admin_parts."Item_code" = sub."Item_code";
-        """, (bom_number,))
-
         # 🚀 **2. Remove from `planned_inventory`**
-        cursor.execute("DELETE FROM planned_inventory WHERE bom_number = %s", (bom_number,))
+        cursor.execute("DELETE FROM planned_inventory WHERE bom_number = %s", (finished_good_code,))
 
         # 🚀 **3. Remove from `crafted_goods`**
-        cursor.execute("DELETE FROM crafted_goods WHERE bom_number = %s", (bom_number,))
+        cursor.execute("DELETE FROM crafted_goods WHERE bom_number = %s", (finished_good_code,))
 
         # 🚀 **4. Log Assembly**
         cursor.execute("""
             INSERT INTO assembly_logs (bom_number, max_crafted_units, created_by, created_at)
             VALUES (%s, %s, %s, NOW());
-        """, (bom_number, quantity, user))
+        """, (finished_good_code, quantity, user))
 
         connection.commit()
         cursor.close()
 
         return jsonify({
-            "message": f"Successfully assembled {bom_number} in {quantity} quantity.",
+            "message": f"Successfully assembled {finished_good_code} in {quantity} quantity.",
             "inventory_updated": True
         }), 200
 
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
 
 # ✅ **List Assembly Logs with Search & Pagination**
 @app.route("/assembly_logs", methods=["POST"])
