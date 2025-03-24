@@ -114,6 +114,139 @@ def login():
 
 
 
+@app.route("/reset_approvals", methods=["POST"])
+@jwt_required()
+def reset_inventory():
+    """
+    Restores inventory from `planned_inventory` back to `admin_parts`
+    and clears planned inventory + crafted goods.
+    """
+    try:
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor()
+
+        # 🚀 **1. Restore On-hand Qty from `planned_inventory` to `admin_parts`**
+        cursor.execute("""
+            UPDATE admin_parts_duplicate
+            SET "On_hand_Qty" = "On_hand_Qty" + sub.restock_qty
+            FROM (
+                SELECT "Item_code", SUM("On_hand_Qty") AS restock_qty
+                FROM planned_inventory
+                GROUP BY "Item_code"
+            ) AS sub
+            WHERE admin_parts_duplicate."Item_code" = sub."Item_code";
+        """)
+
+        # 🚀 **2. Clear `planned_inventory`**
+        cursor.execute("DELETE FROM planned_inventory")
+
+        # 🚀 **3. Clear `crafted_goods`**
+        cursor.execute("DELETE FROM crafted_goods")
+
+        connection.commit()
+        cursor.close()
+
+        return jsonify({"message": "Planned inventory reset successfully."}), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
+
+
+
+@app.route("/plan_crafted_good", methods=["POST"])
+@jwt_required()
+def plan_craftable_good():
+    """
+    Plans a craftable good by reducing inventory in `admin_parts` for ALL occurrences of an `Item_code`.
+    The reductions are stored in `planned_inventory`, and the planned BOM is stored in `crafted_goods`.
+    """
+    try:
+        data = request.get_json()
+        bom_number = data.get("bom_number")
+        max_units = data.get("max_units")
+
+        if not bom_number or not isinstance(max_units, int) or max_units <= 0:
+            return jsonify({"error": "Valid BOM number and max_units are required."}), 400
+
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor()
+
+        # 🚀 **1. Fetch BOM Data and Build Tree**
+        bom_data = fetch_bom_data(connection, bom_number)
+        if not bom_data:
+            return jsonify({"error": "No BOM data found for the given BOM number"}), 404
+
+        item_data, tree = build_bom_tree(bom_data, bom_number)
+
+        # 🚀 **2. Check Stock Availability Before Reduction**
+        max_units, shortages, used_items = calculate_max_units(tree, item_data, bom_number, max_units)
+
+        if shortages:
+            missing_items = [item[0] for item in shortages]
+            return jsonify({"error": f"Not enough stock for items: {missing_items}"}), 400
+
+        # 🚀 **3. Reduce Stock in `admin_parts` and Track in `planned_inventory`**
+        for item_code in used_items:  # ✅ Now only reducing required items
+            item_details = item_data[item_code]
+            required_qty = item_details["Extended_Quantity"] * max_units
+            available_qty = item_details["On_hand_Qty"]
+            item_level = item_details["Item_Level"]  # ✅ Fetch `Item_Level`
+
+            if available_qty >= required_qty:
+                # 🔹 **Reduce stock in `admin_parts` for ALL occurrences of this `Item_code`**
+                cursor.execute("""
+                    UPDATE admin_parts_duplicate
+                    SET "On_hand_Qty" = "On_hand_Qty" - %s
+                    WHERE "Item_code" = %s
+                """, (required_qty, item_code))
+
+                # 🔹 **Check if item exists in `planned_inventory`**
+                cursor.execute("""
+                    SELECT "On_hand_Qty" FROM planned_inventory
+                    WHERE "Item_code" = %s
+                """, (item_code,))
+                existing_record = cursor.fetchone()
+
+                if existing_record:
+                    # 🔹 **Update `planned_inventory` (SUM the reductions)**
+                    cursor.execute("""
+                        UPDATE planned_inventory
+                        SET "On_hand_Qty" = "On_hand_Qty" + %s
+                        WHERE "Item_code" = %s
+                    """, (required_qty, item_code))
+                else:
+                    # 🔹 **Insert new record in `planned_inventory` with `Item_Level`**
+                    cursor.execute("""
+                        INSERT INTO planned_inventory (bom_number, "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity")
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (bom_number, item_level, item_code, required_qty, item_details["Extended_Quantity"]))
+
+        # 🚀 **4. Store Planned BOM in `crafted_goods`**
+        cursor.execute("""
+            INSERT INTO crafted_goods (bom_number, "On_hand_Qty")
+            VALUES (%s, %s)
+            ON CONFLICT (bom_number) DO UPDATE 
+            SET "On_hand_Qty" = EXCLUDED."On_hand_Qty";
+        """, (bom_number, max_units))
+
+        connection.commit()
+        cursor.close()
+
+        return jsonify({
+            "message": f"BOM number {bom_number} planned successfully with {max_units} max units.",
+            "planned_inventory_updated": True
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
+  
+
 
 # ✅ **User Logout API**
 @app.route("/logout", methods=["POST"])
