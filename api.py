@@ -1105,6 +1105,129 @@ def download_bom_data():
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
 
+-----------------NEW:
+
+@app.route("/download_bom_data", methods=["POST"])
+@jwt_required()
+def download_bom_data():
+    """
+    Downloads the BOM data table with selected columns.
+    Returns a Base64-encoded Excel file.
+    """
+    try:
+        data = request.get_json()
+        bom_number = data.get("bom_number", None)  # Optional
+
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+
+        if bom_number:
+            cursor.execute("""
+                SELECT "Item_code", "On_hand_Qty", "Extended_Quantity"
+                FROM bom_data WHERE bom_number = %s
+            """, (bom_number,))
+        else:
+            cursor.execute("""
+                SELECT "Item_code", "On_hand_Qty", "Extended_Quantity"
+                FROM bom_data
+            """)
+
+        bom_data = cursor.fetchall()
+        cursor.close()
+
+        if not bom_data:
+            return jsonify({"error": "No data found"}), 404
+
+        # Convert to DataFrame
+        df = pd.DataFrame(bom_data)
+
+        # Create Excel file with adjusted column widths
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="BOM Data")
+
+            # ✅ Auto-adjust column widths
+            worksheet = writer.sheets["BOM Data"]
+            for col_num, value in enumerate(df.columns.values):
+                col_width = max(df[value].astype(str).map(len).max(), len(value)) + 2
+                worksheet.set_column(col_num, col_num, col_width)
+
+        output.seek(0)
+
+        # Convert to Base64
+        encoded_string = base64.b64encode(output.getvalue()).decode('utf-8')
+
+        return jsonify({"file_data": encoded_string})
+
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+
+@app.route("/download_planned_inventory", methods=["POST"])
+@jwt_required()
+def download_planned_inventory():
+    """
+    Downloads the planned inventory table for a given BOM number.
+    """
+    try:
+        data = request.get_json()
+        bom_number = data.get("bom_number")
+
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+
+        # 🚀 **1. Fetch planned inventory data**
+        query = """
+            SELECT id, bom_number, "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity"
+            FROM planned_inventory
+        """
+        params = ()
+        if bom_number:
+            query += " WHERE bom_number = %s"
+            params = (bom_number,)
+
+        cursor.execute(query, params)
+        planned_data = cursor.fetchall()
+        cursor.close()
+        connection.close()
+
+        # Convert to DataFrame
+        df_planned = pd.DataFrame(planned_data)
+
+        # 🚀 **2. Compute Allocation & Net_Qty**
+        df_planned["Allocation"] = df_planned["Extended_Quantity"]  # Allocation is the deducted quantity
+        df_planned["Net_Qty"] = df_planned["On_hand_Qty"] - df_planned["Allocation"]  # Net_Qty = On_hand_Qty - Allocation
+
+        # 🚀 **3. Reorder Columns**
+        column_order = ["id", "bom_number", "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity", "Allocation", "Net_Qty"]
+        df_planned = df_planned[column_order]
+
+        # 🚀 **4. Create an Excel File**
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df_planned.to_excel(writer, sheet_name="Planned Inventory", index=False)
+
+            # Adjust column widths
+            worksheet = writer.sheets["Planned Inventory"]
+            for i, col in enumerate(df_planned.columns):
+                col_width = max(df_planned[col].astype(str).map(len).max(), len(col)) + 2
+                worksheet.set_column(i, i, col_width)
+
+        output.seek(0)
+
+        # 🚀 **5. Convert to Base64**
+        base64_encoded = base64.b64encode(output.read()).decode("utf-8")
+
+        return jsonify({"file_data": base64_encoded})
+
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
 
         
 if __name__ == "__main__":
