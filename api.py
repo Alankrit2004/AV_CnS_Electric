@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from fetch_data import fetch_bom_data
@@ -12,8 +12,10 @@ from threading import Thread
 from queue import Queue
 from datetime import datetime, timedelta, timezone
 import threading
-import pandas as pd
+import pandas as pd 
+import io
 from io import BytesIO
+import base64
 
 app = Flask(__name__)
 CORS(app)
@@ -113,13 +115,294 @@ def login():
     return jsonify({"error": "Invalid credentials"}), 401
 
 
+# ✅ **User Logout API**
+@app.route("/logout", methods=["POST"])
+@jwt_required()
+def logout():
+    return jsonify({"message": "Successfully logged out!"})
+
+@app.route("/get_craftable_goods", methods=["POST"])
+@jwt_required()
+def get_craftable_goods():
+    connection = None
+    try:
+        data = request.get_json()
+        craft_quantity = data.get("quantity")
+        specific_bom = data.get("bom_number")
+
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+
+        if specific_bom:
+            batch_codes = [specific_bom]
+        else:
+            cursor.execute('''
+                SELECT DISTINCT "bom_number" 
+                FROM "admin_parts" 
+                LIMIT 10
+            ''')
+            batch_codes = [row['bom_number'] for row in cursor.fetchall()]
+            cursor.close()
+
+        craftable_goods = []
+        non_craftable_goods = []
+
+        for fg_code in batch_codes:
+            def process_code():
+                bom_data = fetch_bom_data(connection, fg_code)
+                if not bom_data:
+                    return None
+
+                item_data, tree = build_bom_tree(bom_data, fg_code)
+                quantity_to_check = craft_quantity or 1  # Use 1 if not specified
+                return calculate_max_units(tree, item_data, fg_code, quantity_to_check)
+
+            status, result = run_with_timeout(process_code, timeout=5)
+
+            if status == 'timeout':
+                print(f"Timeout processing {fg_code}")
+                continue
+            elif status == 'error':
+                print(f"Error processing finished good {fg_code}: {result}")
+                continue
+            elif status == 'success' and result:
+                max_units, shortages, used_items = result
+
+                if craft_quantity:
+                    if shortages:
+                        for item in shortages:
+                            cursor = connection.cursor()
+                            cursor.execute("""
+                                INSERT INTO non_craftable_list (bom_number, item_code, missing_qty, craft_attempt_qty, timestamp)
+                                VALUES (%s, %s, %s, %s, CURRENT_DATE)
+                            """, (fg_code, item[0], item[1], craft_quantity))
+                            connection.commit()
+
+                        non_craftable_goods.append({
+                            "finished_good_code": fg_code,
+                            "missing_items": [
+                                {"item_code": item[0], "missing_qty": item[1]}
+                                for item in shortages
+                            ]
+                        })
+                    else:
+                        craftable_goods.append({
+                            "finished_good_code": fg_code,
+                            "can_craft_quantity": craft_quantity
+                        })
+                else:
+                    if shortages:
+                        non_craftable_goods.append({
+                            "finished_good_code": fg_code,
+                            "missing_items": [item[0] for item in shortages]
+                        })
+                    elif max_units > 0:
+                        craftable_goods.append({
+                            "finished_good_code": fg_code,
+                            "max_units": max_units
+                        })
+
+        return jsonify({
+            "craftable_goods": craftable_goods,
+            "non_craftable_goods": non_craftable_goods
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+    finally:
+        if connection:
+            connection.close()
+
+@app.route("/list_non_craftable", methods=["POST"])
+@jwt_required()
+def list_non_craftable_goods():
+    try:
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT bom_number, item_code, missing_qty, craft_attempt_qty, TO_CHAR(timestamp, 'DD-MM-YYYY') as timestamp
+            FROM non_craftable_list
+            ORDER BY timestamp DESC
+        """)
+        data = cursor.fetchall()
+        cursor.close()
+        connection.close()
+
+        return jsonify({"non_craftable_list": data})
+
+    except Exception as e:
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+
+@app.route("/download_non_craftable_list", methods=["POST"])
+@jwt_required()
+def download_non_craftable_list():
+    try:
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT bom_number, item_code, missing_qty, craft_attempt_qty, TO_CHAR(timestamp, 'DD-MM-YYYY') as timestamp
+            FROM non_craftable_list
+            ORDER BY timestamp DESC
+        """)
+        data = cursor.fetchall()
+        cursor.close()
+        connection.close()
+
+        if not data:
+            return jsonify({"error": "No non-craftable data found"}), 404
+
+        df = pd.DataFrame(data)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name="Non Craftable List", index=False)
+            worksheet = writer.sheets["Non Craftable List"]
+            for i, col in enumerate(df.columns):
+                col_width = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                worksheet.set_column(i, i, col_width)
+
+        output.seek(0)
+        base64_encoded = base64.b64encode(output.read()).decode("utf-8")
+
+        return jsonify({"file_data": base64_encoded})
+
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+  
+
+
+
+@app.route("/plan_crafted_good", methods=["POST"])
+@jwt_required()
+def plan_craftable_good():
+    """
+    Plans a craftable good by reducing inventory in `admin_parts`.
+    Stores deductions in `planned_inventory`, and the planned BOM in `crafted_goods`.
+    """
+    try:
+        data = request.get_json()
+        bom_number = data.get("bom_number")
+        quantity = data.get("quantity")
+
+        if not bom_number or not isinstance(quantity, int) or quantity <= 0:
+            return jsonify({"error": "Valid BOM number and quantity are required."}), 400
+
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor()
+
+        # 1. Fetch BOM and Build Tree
+        bom_data = fetch_bom_data(connection, bom_number)
+        if not bom_data:
+            return jsonify({"error": "No BOM data found for the given BOM number"}), 404
+
+        item_data, tree = build_bom_tree(bom_data, bom_number)
+
+        # 2. Check Craftability
+        _, shortages, used_items = calculate_max_units(tree, item_data, bom_number, quantity)
+        if shortages:
+            missing_items = [item[0] for item in shortages]
+            return jsonify({"error": f"Not enough stock for items: {missing_items}"}), 400
+
+        # 3. Deduct stock and update planned_inventory
+        for item_code in used_items:
+            required_qty = used_items[item_code]
+            item_details = item_data[item_code]
+            item_level = item_details["Item_Level"]
+            extended_qty = item_details["Extended_Quantity"]
+
+            # Fetch On_hand_Qty BEFORE deduction
+            cursor.execute("""
+                SELECT "On_hand_Qty" FROM admin_parts
+                WHERE "Item_code" = %s AND bom_number = %s
+            """, (item_code, bom_number))
+            result = cursor.fetchone()
+            admin_on_hand_qty = result["On_hand_Qty"] if result else 0
+
+            # Prevent stock from becoming negative (just in case)
+            if admin_on_hand_qty < required_qty:
+                required_qty = admin_on_hand_qty
+
+            # Deduct stock
+            cursor.execute("""
+                UPDATE admin_parts
+                SET "On_hand_Qty" = GREATEST("On_hand_Qty" - %s, 0)
+                WHERE "Item_code" = %s AND bom_number = %s
+            """, (required_qty, item_code, bom_number))
+
+            # Check if already in planned_inventory
+            cursor.execute("""
+                SELECT "Allocation" FROM planned_inventory
+                WHERE "Item_code" = %s AND bom_number = %s
+            """, (item_code, bom_number))
+            existing = cursor.fetchone()
+
+            net_qty = max(admin_on_hand_qty - required_qty, 0)
+
+            if existing:
+                new_alloc = existing["Allocation"] + required_qty
+                cursor.execute("""
+                    UPDATE planned_inventory
+                    SET "Allocation" = %s,
+                        "On_hand_Qty" = %s,
+                        "Net_Qty" = %s
+                    WHERE "Item_code" = %s AND bom_number = %s
+                """, (new_alloc, admin_on_hand_qty, net_qty, item_code, bom_number))
+            else:
+                cursor.execute("""
+                    INSERT INTO planned_inventory (
+                        bom_number, "Item_Level", "Item_code", 
+                        "Allocation", "Extended_Quantity", 
+                        "On_hand_Qty", "Net_Qty"
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    bom_number, item_level, item_code,
+                    required_qty, extended_qty,
+                    admin_on_hand_qty, net_qty
+                ))
+
+        # 4. Log in crafted_goods
+        cursor.execute("""
+            INSERT INTO crafted_goods (bom_number, "On_hand_Qty")
+            VALUES (%s, %s)
+            ON CONFLICT (bom_number) DO NOTHING;
+        """, (bom_number, quantity))
+
+        connection.commit()
+        cursor.close()
+
+        return jsonify({
+            "message": f"BOM {bom_number} planned successfully for {quantity} unit(s).",
+            "planned_inventory_updated": True
+        }), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+
+
 
 @app.route("/reset_approvals", methods=["POST"])
 @jwt_required()
 def reset_inventory():
     """
-    Restores inventory from `planned_inventory` back to `admin_parts`
-    and clears planned inventory + crafted goods.
+    Restores inventory from `planned_inventory` back to `admin_parts_duplicate`
+    by summing up `Allocated` per `Item_code`. Also clears `planned_inventory`, `crafted_goods`, and `non_craftable_list`.
     """
     try:
         connection = connect_to_database()
@@ -128,16 +411,16 @@ def reset_inventory():
 
         cursor = connection.cursor()
 
-        # 🚀 **1. Restore On-hand Qty from `planned_inventory` to `admin_parts`**
+        # 🚀 **1. Restore Allocated Qty back to `admin_parts_duplicate`**
         cursor.execute("""
-            UPDATE admin_parts_duplicate
+            UPDATE admin_parts
             SET "On_hand_Qty" = "On_hand_Qty" + sub.restock_qty
             FROM (
-                SELECT "Item_code", SUM("On_hand_Qty") AS restock_qty
+                SELECT "Item_code", SUM("Allocation") AS restock_qty
                 FROM planned_inventory
                 GROUP BY "Item_code"
             ) AS sub
-            WHERE admin_parts_duplicate."Item_code" = sub."Item_code";
+            WHERE admin_parts."Item_code" = sub."Item_code";
         """)
 
         # 🚀 **2. Clear `planned_inventory`**
@@ -146,298 +429,180 @@ def reset_inventory():
         # 🚀 **3. Clear `crafted_goods`**
         cursor.execute("DELETE FROM crafted_goods")
 
+        # 🚀 **4. Clear `non_craftable_list`**
+        cursor.execute("DELETE FROM non_craftable_list")
+
         connection.commit()
         cursor.close()
 
-        return jsonify({"message": "Planned inventory reset successfully."}), 200
+        return jsonify({"message": "Planned inventory and non-craftable list reset successfully."}), 200
 
     except Exception as e:
         return jsonify({"error": f"Database error: {e}"}), 500
 
 
-
-@app.route("/plan_crafted_good", methods=["POST"])
-@jwt_required()
-def plan_craftable_good():
-    """
-    Plans a craftable good by reducing inventory in `admin_parts` for ALL occurrences of an `Item_code`.
-    The reductions are stored in `planned_inventory`, and the planned BOM is stored in `crafted_goods`.
-    """
-    try:
-        data = request.get_json()
-        bom_number = data.get("bom_number")
-        max_units = data.get("max_units")
-
-        if not bom_number or not isinstance(max_units, int) or max_units <= 0:
-            return jsonify({"error": "Valid BOM number and max_units are required."}), 400
-
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor()
-
-        # 🚀 **1. Fetch BOM Data and Build Tree**
-        bom_data = fetch_bom_data(connection, bom_number)
-        if not bom_data:
-            return jsonify({"error": "No BOM data found for the given BOM number"}), 404
-
-        item_data, tree = build_bom_tree(bom_data, bom_number)
-
-        # 🚀 **2. Check Stock Availability Before Reduction**
-        max_units, shortages, used_items = calculate_max_units(tree, item_data, bom_number, max_units)
-
-        if shortages:
-            missing_items = [item[0] for item in shortages]
-            return jsonify({"error": f"Not enough stock for items: {missing_items}"}), 400
-
-        # 🚀 **3. Reduce Stock in `admin_parts` and Track in `planned_inventory`**
-        for item_code in used_items:  # ✅ Now only reducing required items
-            item_details = item_data[item_code]
-            required_qty = item_details["Extended_Quantity"] * max_units
-            available_qty = item_details["On_hand_Qty"]
-            item_level = item_details["Item_Level"]  # ✅ Fetch `Item_Level`
-
-            if available_qty >= required_qty:
-                # 🔹 **Reduce stock in `admin_parts` for ALL occurrences of this `Item_code`**
-                cursor.execute("""
-                    UPDATE admin_parts_duplicate
-                    SET "On_hand_Qty" = "On_hand_Qty" - %s
-                    WHERE "Item_code" = %s
-                """, (required_qty, item_code))
-
-                # 🔹 **Check if item exists in `planned_inventory`**
-                cursor.execute("""
-                    SELECT "On_hand_Qty" FROM planned_inventory
-                    WHERE "Item_code" = %s
-                """, (item_code,))
-                existing_record = cursor.fetchone()
-
-                if existing_record:
-                    # 🔹 **Update `planned_inventory` (SUM the reductions)**
-                    cursor.execute("""
-                        UPDATE planned_inventory
-                        SET "On_hand_Qty" = "On_hand_Qty" + %s
-                        WHERE "Item_code" = %s
-                    """, (required_qty, item_code))
-                else:
-                    # 🔹 **Insert new record in `planned_inventory` with `Item_Level`**
-                    cursor.execute("""
-                        INSERT INTO planned_inventory (bom_number, "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity")
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (bom_number, item_level, item_code, required_qty, item_details["Extended_Quantity"]))
-
-        # 🚀 **4. Store Planned BOM in `crafted_goods`**
-        cursor.execute("""
-            INSERT INTO crafted_goods (bom_number, "On_hand_Qty")
-            VALUES (%s, %s)
-            ON CONFLICT (bom_number) DO UPDATE 
-            SET "On_hand_Qty" = EXCLUDED."On_hand_Qty";
-        """, (bom_number, max_units))
-
-        connection.commit()
-        cursor.close()
-
-        return jsonify({
-            "message": f"BOM number {bom_number} planned successfully with {max_units} max units.",
-            "planned_inventory_updated": True
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": f"Database error: {e}"}), 500
-  
-
-
-# ✅ **User Logout API**
-@app.route("/logout", methods=["POST"])
-@jwt_required()
-def logout():
-    return jsonify({"message": "Successfully logged out!"})
-
-# # ✅ **Get Craftable & Non-Craftable Goods API**
-# @app.route("/get_craftable_goods", methods=["POST"])
+# @app.route("/reset_approvals", methods=["POST"])
 # @jwt_required()
-# def get_craftable_goods():
-#     connection = None
+# def reset_inventory():
+#     """
+#     Restores inventory from `planned_inventory` back to `admin_parts`
+#     and clears planned inventory + crafted goods.
+#     """
 #     try:
 #         connection = connect_to_database()
 #         if not connection:
 #             return jsonify({"error": "Database connection failed"}), 500
 
-#         cursor = connection.cursor(cursor_factory=RealDictCursor)
-        
-#         cursor.execute('''
-#             SELECT DISTINCT "bom_number" 
-#             FROM "admin_parts_duplicate" 
-#             LIMIT 10
-#         ''')
-        
-#         batch_codes = [row['bom_number'] for row in cursor.fetchall()]
+#         cursor = connection.cursor()
+
+#         # 🚀 **1. Restore On-hand Qty from `planned_inventory` to `admin_parts`**
+#         cursor.execute("""
+#             UPDATE admin_parts
+#             SET "On_hand_Qty" = "On_hand_Qty" + sub.restock_qty
+#             FROM (
+#                 SELECT "Item_code", SUM("On_hand_Qty") AS restock_qty
+#                 FROM planned_inventory
+#                 GROUP BY "Item_code"
+#             ) AS sub
+#             WHERE admin_parts."Item_code" = sub."Item_code";
+#         """)
+
+#         # 🚀 **2. Clear `planned_inventory`**
+#         cursor.execute("DELETE FROM planned_inventory")
+
+#         # 🚀 **3. Clear `crafted_goods`**
+#         cursor.execute("DELETE FROM crafted_goods")
+
+#         connection.commit()
 #         cursor.close()
-        
-#         craftable_goods = []
-#         non_craftable_goods = []
-        
-#         for fg_code in batch_codes:
-#             def process_code():
-#                 bom_data = fetch_bom_data(connection, fg_code)
-#                 if not bom_data:
-#                     print(f"No BOM data found for {fg_code}")
-#                     return None
-                
-#                 item_data, tree = build_bom_tree(bom_data, fg_code)
-#                 max_units, shortages = calculate_max_units(tree, item_data, fg_code, 1)
-                
-#                 return (max_units, shortages)
-            
-#             status, result = run_with_timeout(process_code, timeout=5)
-            
-#             if status == 'timeout':
-#                 print(f"Timeout processing {fg_code}")
-#                 continue
-#             elif status == 'error':
-#                 print(f"Error processing finished good {fg_code}: {result}")
-#                 continue
-#             elif status == 'success' and result:
-#                 max_units, shortages = result
-#                 if shortages:
-#                     missing_items = [item[0] for item in shortages]
-#                     non_craftable_goods.append((fg_code, missing_items))
-#                 elif max_units > 0:
-#                     craftable_goods.append((fg_code, max_units))
-        
-#         # Store the results in the database
-#         print(f"Craftable goods: {craftable_goods}")
-#         print(f"Non-craftable goods: {non_craftable_goods}")
-#         # store_craftable_non_craftable_goods(connection, craftable_goods, non_craftable_goods)
-        
-#         response_craftable = [
-#             {"finished_good_code": fg_code, "max_units": max_units}
-#             for fg_code, max_units in craftable_goods
-#         ]
-        
-#         response_non_craftable = [
-#             {"finished_good_code": fg_code, "missing_items": missing_items}
-#             for fg_code, missing_items in non_craftable_goods
-#         ]
-        
-#         return jsonify({
-#             "craftable_goods": response_craftable,
-#             "non_craftable_goods": response_non_craftable
-#         })
-   
+
+#         return jsonify({"message": "Planned inventory reset successfully."}), 200
+
 #     except Exception as e:
-#         print(f"Error in get_craftable_goods: {str(e)}")
-#         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-   
-#     finally:
-#         if connection:
-#             connection.close()
+#         return jsonify({"error": f"Database error: {e}"}), 500
 
 
-@app.route("/get_craftable_goods", methods=["POST"])
+
+
+@app.route("/download_bom_data", methods=["POST"])
 @jwt_required()
-def get_craftable_goods():
-    connection = None
+def download_bom_data():
+    """
+    Downloads the BOM data table with selected columns.
+    Returns a Base64-encoded Excel file.
+    """
     try:
+        data = request.get_json()
+        bom_number = data.get("bom_number", None)  # Optional
+
         connection = connect_to_database()
         if not connection:
             return jsonify({"error": "Database connection failed"}), 500
 
         cursor = connection.cursor(cursor_factory=RealDictCursor)
-        
-        cursor.execute('''
-            SELECT DISTINCT "bom_number" 
-            FROM "admin_parts_duplicate" 
-            LIMIT 10
-        ''')
-        
-        batch_codes = [row['bom_number'] for row in cursor.fetchall()]
+
+        if bom_number:
+            cursor.execute("""
+                SELECT "Item_code", "On_hand_Qty", "Extended_Quantity"
+                FROM admin_parts WHERE bom_number = %s
+            """, (bom_number,))
+        else:
+            cursor.execute("""
+                SELECT "Item_code", "On_hand_Qty", "Extended_Quantity"
+                FROM admin_parts
+            """)
+
+        bom_data = cursor.fetchall()
         cursor.close()
-        
-        craftable_goods = []
-        non_craftable_goods = []
-        
-        for fg_code in batch_codes:
-            def process_code():
-                bom_data = fetch_bom_data(connection, fg_code)
-                if not bom_data:
-                    print(f"No BOM data found for {fg_code}")
-                    return None
-                
-                item_data, tree = build_bom_tree(bom_data, fg_code)
-                max_units, shortages, used_items = calculate_max_units(tree, item_data, fg_code, 1)  # ✅ Correct
-                
-                return (max_units, shortages, used_items)  # ✅ Fixed (include all returned values)
-            
-            status, result = run_with_timeout(process_code, timeout=5)
-            
-            if status == 'timeout':
-                print(f"Timeout processing {fg_code}")
-                continue
-            elif status == 'error':
-                print(f"Error processing finished good {fg_code}: {result}")
-                continue
-            elif status == 'success' and result:
-                max_units, shortages, used_items = result  # ✅ Correctly unpacking all three values
-                if shortages:
-                    missing_items = [item[0] for item in shortages]
-                    non_craftable_goods.append((fg_code, missing_items))
-                elif max_units > 0:
-                    craftable_goods.append((fg_code, max_units))
-        
-        # Store the results in the database
-        print(f"Craftable goods: {craftable_goods}")
-        print(f"Non-craftable goods: {non_craftable_goods}")
-        # store_craftable_non_craftable_goods(connection, craftable_goods, non_craftable_goods)
-        
-        response_craftable = [
-            {"finished_good_code": fg_code, "max_units": max_units}
-            for fg_code, max_units in craftable_goods
-        ]
-        
-        response_non_craftable = [
-            {"finished_good_code": fg_code, "missing_items": missing_items}
-            for fg_code, missing_items in non_craftable_goods
-        ]
-        
-        return jsonify({
-            "craftable_goods": response_craftable,
-            "non_craftable_goods": response_non_craftable
-        })
-   
+
+        if not bom_data:
+            return jsonify({"error": "No data found"}), 404
+
+        # Convert to DataFrame
+        df = pd.DataFrame(bom_data)
+
+        # Create Excel file with adjusted column widths
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="BOM Data")
+
+            # ✅ Auto-adjust column widths
+            worksheet = writer.sheets["BOM Data"]
+            for col_num, value in enumerate(df.columns.values):
+                col_width = max(df[value].astype(str).map(len).max(), len(value)) + 2
+                worksheet.set_column(col_num, col_num, col_width)
+
+        output.seek(0)
+
+        # Convert to Base64
+        encoded_string = base64.b64encode(output.getvalue()).decode('utf-8')
+
+        return jsonify({"file_data": encoded_string})
+
     except Exception as e:
-        print(f"Error in get_craftable_goods: {str(e)}")
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-   
-    finally:
-        if connection:
-            connection.close()
-
-
-# Timeout decorator
-from contextlib import contextmanager
-import signal
-
-class TimeoutException(Exception):
-    pass
-
-@contextmanager
-def timeout(seconds):
-    def _handle_timeout(signum, frame):
-        raise TimeoutError(f"Function call timed out after {seconds} seconds")
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
     
-    # Set the signal handler and a alarm
-    signal.signal(signal.SIGALRM, _handle_timeout)
-    signal.alarm(seconds)
-    
+@app.route("/download_planned_inventory", methods=["POST"])
+@jwt_required()
+def download_planned_inventory():
+    """
+    Downloads the entire planned inventory table or for a specific BOM number.
+    """
     try:
-        yield
-    finally:
-        # Cancel the alarm
-        signal.alarm(0)
+        data = request.get_json()
+        bom_number = data.get("bom_number")
 
-     
+        connection = connect_to_database()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+
+        # 🚀 **1. Fetch planned inventory data**
+        query = """
+            SELECT id, bom_number, "Item_Level", "Item_code", "On_hand_Qty", 
+                   "Extended_Quantity", "Allocation", "Net_Qty"
+            FROM planned_inventory
+        """
+        params = ()
+        if bom_number:
+            query += " WHERE bom_number = %s"
+            params = (bom_number,)
+
+        cursor.execute(query, params)
+        planned_data = cursor.fetchall()
+        cursor.close()
+        connection.close()
+
+        if not planned_data:
+            return jsonify({"error": "No planned inventory data found"}), 404
+
+        # Convert to DataFrame
+        df_planned = pd.DataFrame(planned_data)
+
+        # 🚀 **2. Create an Excel File**
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df_planned.to_excel(writer, sheet_name="Planned Inventory", index=False)
+
+            # Adjust column widths
+            worksheet = writer.sheets["Planned Inventory"]
+            for i, col in enumerate(df_planned.columns):
+                col_width = max(df_planned[col].astype(str).map(len).max(), len(col)) + 2
+                worksheet.set_column(i, i, col_width)
+
+        output.seek(0)
+
+        # 🚀 **3. Convert to Base64**
+        base64_encoded = base64.b64encode(output.read()).decode("utf-8")
+
+        return jsonify({"file_data": base64_encoded})
+
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+        
+
+        
 @app.route("/assemble", methods=["POST"])
 @jwt_required()
 def assemble():
@@ -493,136 +658,69 @@ def list_assembly_logs():
         search_text = data.get("search_text", "").strip()
         page = data.get("page", 1)  # Default page is 1
         page_size = data.get("page_size", 10)  # Default page size is 10
-        
+       
         # Validate pagination values
         if not isinstance(page, int) or page <= 0:
             return jsonify({"error": "Invalid page number"}), 400
         if not isinstance(page_size, int) or page_size <= 0:
             return jsonify({"error": "Invalid page size"}), 400
-        
+       
         offset = (page - 1) * page_size  # Calculate offset for pagination
-        
+       
         connection = connect_to_database()
         if not connection:
             return jsonify({"error": "Database connection failed"}), 500
-        
+       
         cursor = connection.cursor()
-        
+       
         # Base query
         query = "SELECT id, bom_number, max_crafted_units, created_by, created_at FROM assembly_logs"
         params = []
-        
+       
         # Apply search filter if provided
         if search_text:
             query += " WHERE bom_number ILIKE %s OR created_by ILIKE %s"
             params.extend([f"%{search_text}%", f"%{search_text}%"])
         
+        # Count total rows before applying pagination
+        count_query = "SELECT COUNT(*) AS total FROM assembly_logs"
+        if search_text:
+            count_query += " WHERE bom_number ILIKE %s OR created_by ILIKE %s"
+        
+        cursor.execute(count_query, tuple(params[:2] if search_text else []))
+        count_result = cursor.fetchone()
+        
+        # Handle different return types safely
+        total_count = 0
+        if count_result is not None:
+            if isinstance(count_result, dict):
+                total_count = count_result.get('total', 0)
+            elif isinstance(count_result, (list, tuple)) and len(count_result) > 0:
+                total_count = count_result[0]
+            else:
+                total_count = 0
+       
         # Add pagination
         query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
         params.extend([page_size, offset])
-        
+       
         cursor.execute(query, tuple(params))
         logs = cursor.fetchall()
         cursor.close()
         connection.close()
-        
-        return jsonify({"assembly_logs": logs, "page": page, "page_size": page_size}), 200
-    
-    except Exception as e:
-        print(f"API error: {str(e)}")
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
-
-
-@app.route("/plan_crafted_good", methods=["POST"])
-@jwt_required()
-def plan_craftable_good():
-    """
-    Plans a craftable good by reducing inventory in `admin_parts` for ALL occurrences of an `Item_code`.
-    The reductions are stored in `planned_inventory`, and the planned BOM is stored in `crafted_goods`.
-    """
-    try:
-        data = request.get_json()
-        bom_number = data.get("bom_number")
-        max_units = data.get("max_units")
-
-        if not bom_number or not isinstance(max_units, int) or max_units <= 0:
-            return jsonify({"error": "Valid BOM number and max_units are required."}), 400
-
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor()
-
-        # 🚀 **1. Fetch BOM Data and Build Tree**
-        bom_data = fetch_bom_data(connection, bom_number)
-        if not bom_data:
-            return jsonify({"error": "No BOM data found for the given BOM number"}), 404
-
-        item_data, tree = build_bom_tree(bom_data, bom_number)
-
-        # 🚀 **2. Check Stock Availability Before Reduction**
-        max_units, shortages, used_items = calculate_max_units(tree, item_data, bom_number, max_units)
-
-        if shortages:
-            missing_items = [item[0] for item in shortages]
-            return jsonify({"error": f"Not enough stock for items: {missing_items}"}), 400
-
-        # 🚀 **3. Reduce Stock in `admin_parts` and Track in `planned_inventory`**
-        for item_code in used_items:  # ✅ Now only reducing required items
-            item_details = item_data[item_code]
-            required_qty = item_details["Extended_Quantity"] * max_units
-            available_qty = item_details["On_hand_Qty"]
-            item_level = item_details["Item_Level"]  # ✅ Fetch `Item_Level`
-
-            if available_qty >= required_qty:
-                # 🔹 **Reduce stock in `admin_parts` for ALL occurrences of this `Item_code`**
-                cursor.execute("""
-                    UPDATE admin_parts_duplicate
-                    SET "On_hand_Qty" = "On_hand_Qty" - %s
-                    WHERE "Item_code" = %s
-                """, (required_qty, item_code))
-
-                # 🔹 **Check if item exists in `planned_inventory`**
-                cursor.execute("""
-                    SELECT "On_hand_Qty" FROM planned_inventory
-                    WHERE "Item_code" = %s
-                """, (item_code,))
-                existing_record = cursor.fetchone()
-
-                if existing_record:
-                    # 🔹 **Update `planned_inventory` (SUM the reductions)**
-                    cursor.execute("""
-                        UPDATE planned_inventory
-                        SET "On_hand_Qty" = "On_hand_Qty" + %s
-                        WHERE "Item_code" = %s
-                    """, (required_qty, item_code))
-                else:
-                    # 🔹 **Insert new record in `planned_inventory` with `Item_Level`**
-                    cursor.execute("""
-                        INSERT INTO planned_inventory (bom_number, "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity")
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (bom_number, item_level, item_code, required_qty, item_details["Extended_Quantity"]))
-
-        # 🚀 **4. Store Planned BOM in `crafted_goods`**
-        cursor.execute("""
-            INSERT INTO crafted_goods (bom_number, "On_hand_Qty")
-            VALUES (%s, %s)
-            ON CONFLICT (bom_number) DO UPDATE 
-            SET "On_hand_Qty" = EXCLUDED."On_hand_Qty";
-        """, (bom_number, max_units))
-
-        connection.commit()
-        cursor.close()
-
+       
         return jsonify({
-            "message": f"BOM number {bom_number} planned successfully with {max_units} max units.",
-            "planned_inventory_updated": True
+            "assembly_logs": logs, 
+            "page": page, 
+            "page_size": page_size,
+            "total_count": total_count
         }), 200
-
+   
     except Exception as e:
-        return jsonify({"error": f"Database error: {e}"}), 500
-
+        import traceback
+        print(f"API error: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route("/admin_parts", methods=["POST"])
 @jwt_required()
@@ -682,6 +780,9 @@ def get_admin_parts():
     finally:
         cursor.close()
         connection.close()
+
+
+
 
 
 
@@ -747,9 +848,6 @@ def fetch_or_search_crafted_goods():
     finally:
         cursor.close()
         connection.close()
-
-
-
 
 
 @app.route("/approved_crafted_goods", methods=["POST"])
@@ -853,37 +951,50 @@ def add_edit_admin_parts():
     
     # Check if ID exists for update operation
     record_id = data.get("id")
-    
-    # Get required fields with proper case matching
-    bom_number = data.get("bom_number")  # int8
-    item_code = data.get("Item_code")    # varchar
-    item_level = data.get("Item_Level", 0)  # int4
-    description = data.get("description", "") # text
-    type = data.get("Type")              # varchar
-    on_hand_qty = data.get("On_hand_Qty", 0.0)  # float8
-    extended_quantity = data.get("Extended_Quantity", 1.0)  # float8
-    is_active = data.get("is_active", True)  # bool
 
-    # Validate required fields and types
-    if not all([bom_number, item_code, type]):
+    # Fetch fields from request
+    fields = {
+        "bom_number": (data.get("bom_number"), int, "integer"),
+        "item_code": (data.get("Item_code"), str, "text"),
+        "item_level": (data.get("Item_Level", 0), int, "integer"),
+        "description": (data.get("description", ""), str, "text"),
+        "type": (data.get("Type"), str, "text"),
+        "on_hand_qty": (data.get("On_hand_Qty", 0.0), float, "float"),
+        "extended_quantity": (data.get("Extended_Quantity", 1.0), float, "float"),
+        "is_active": (data.get("is_active", True), bool, "boolean"),
+    }
+
+    # Validate required fields
+    missing_fields = [key for key in ["bom_number", "item_code", "type"] if not fields[key][0]]
+    if missing_fields:
         return jsonify({
             "error": "Required fields missing",
-            "required": ["bom_number", "Item_code", "Type"]
+            "missing_fields": missing_fields
         }), 400
 
-    try:
-        # Type validation
-        bom_number = int(bom_number)
-        item_level = int(item_level)
-        on_hand_qty = float(on_hand_qty)
-        extended_quantity = float(extended_quantity)
-        is_active = bool(is_active)
-        if record_id:
-            record_id = int(record_id)
+    # Type validation
+    errors = []
+    validated_data = {}
 
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid data types provided"}), 400
+    for field, (value, expected_type, expected_type_str) in fields.items():
+        try:
+            validated_data[field] = expected_type(value)
+        except (ValueError, TypeError):
+            errors.append(f"{field} data type incorrect, expected {expected_type_str}")
 
+    if record_id:
+        try:
+            validated_data["id"] = int(record_id)
+        except ValueError:
+            errors.append("id data type incorrect, expected integer")
+
+    if errors:
+        return jsonify({
+            "error": "Invalid data types provided",
+            "details": errors
+        }), 400
+
+    # Database connection
     connection = connect_to_database()
     if not connection:
         return jsonify({"error": "Database connection failed"}), 500
@@ -891,7 +1002,7 @@ def add_edit_admin_parts():
     try:
         cursor = connection.cursor(cursor_factory=RealDictCursor)
         
-        if record_id:
+        if "id" in validated_data:
             # UPDATE existing record
             cursor.execute("""
                 UPDATE admin_parts SET
@@ -906,19 +1017,19 @@ def add_edit_admin_parts():
                 WHERE id = %s
                 RETURNING *;
             """, (
-                bom_number,
-                item_code,
-                item_level,
-                description,
-                type,
-                on_hand_qty,
-                extended_quantity,
-                is_active,
-                record_id
+                validated_data["bom_number"],
+                validated_data["item_code"],
+                validated_data["item_level"],
+                validated_data["description"],
+                validated_data["type"],
+                validated_data["on_hand_qty"],
+                validated_data["extended_quantity"],
+                validated_data["is_active"],
+                validated_data["id"]
             ))
-            
+
             if cursor.rowcount == 0:
-                return jsonify({"error": f"No record found with id {record_id}"}), 404
+                return jsonify({"error": f"No record found with id {validated_data['id']}"}), 404
                 
         else:
             # INSERT new record
@@ -938,21 +1049,21 @@ def add_edit_admin_parts():
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_DATE, %s)
                 RETURNING *;
             """, (
-                bom_number,
-                item_code,
-                item_level,
-                description,
-                type,
-                on_hand_qty,
-                extended_quantity,
-                is_active,
+                validated_data["bom_number"],
+                validated_data["item_code"],
+                validated_data["item_level"],
+                validated_data["description"],
+                validated_data["type"],
+                validated_data["on_hand_qty"],
+                validated_data["extended_quantity"],
+                validated_data["is_active"],
                 current_user
             ))
 
         result = cursor.fetchone()
         connection.commit()
         
-        operation = "updated" if record_id else "created"
+        operation = "updated" if "id" in validated_data else "created"
         return jsonify({
             "message": f"Admin part {operation} successfully",
             "data": result
@@ -969,265 +1080,6 @@ def add_edit_admin_parts():
             cursor.close()
         if connection:
             connection.close()
-
-
-@app.route("/reset_approvals", methods=["POST"])
-@jwt_required()
-def reset_inventory():
-    """
-    Restores inventory from `planned_inventory` back to `admin_parts`
-    and clears planned inventory + crafted goods.
-    """
-    try:
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor()
-
-        # 🚀 **1. Restore On-hand Qty from `planned_inventory` to `admin_parts`**
-        cursor.execute("""
-            UPDATE admin_parts_duplicate
-            SET "On_hand_Qty" = "On_hand_Qty" + sub.restock_qty
-            FROM (
-                SELECT "Item_code", SUM("On_hand_Qty") AS restock_qty
-                FROM planned_inventory
-                GROUP BY "Item_code"
-            ) AS sub
-            WHERE admin_parts_duplicate."Item_code" = sub."Item_code";
-        """)
-
-        # 🚀 **2. Clear `planned_inventory`**
-        cursor.execute("DELETE FROM planned_inventory")
-
-        # 🚀 **3. Clear `crafted_goods`**
-        cursor.execute("DELETE FROM crafted_goods")
-
-        connection.commit()
-        cursor.close()
-
-        return jsonify({"message": "Planned inventory reset successfully."}), 200
-
-    except Exception as e:
-        return jsonify({"error": f"Database error: {e}"}), 500
-
-
-@app.route("/download_planned_inventory", methods=["POST"])
-@jwt_required()
-def download_planned_inventory():
-    """
-    Downloads the planned inventory table for a given BOM number.
-    """
-    try:
-        data = request.get_json()
-        bom_number = data.get("bom_number")
-
-        if not bom_number:
-            return jsonify({"error": "BOM number is required"}), 400
-
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        # 🚀 **1. Fetch planned inventory data**
-        cursor.execute("""
-            SELECT bom_number, "Item_code", "Item_Level", "On_hand_Qty", "Extended_Quantity"
-            FROM planned_inventory
-            WHERE bom_number = %s
-        """, (bom_number,))
-        planned_data = cursor.fetchall()
-
-        cursor.close()
-
-        # Convert to DataFrame
-        df_planned = pd.DataFrame(planned_data)
-
-        # 🚀 **2. Create an Excel File**
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_planned.to_excel(writer, sheet_name="Planned Inventory", index=False)
-
-        output.seek(0)
-
-        return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                         as_attachment=True, download_name=f"planned_inventory_{bom_number}.xlsx")
-
-    except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
-
-@app.route("/download_bom_data", methods=["POST"])
-@jwt_required()
-def download_bom_data():
-    """
-    Download BOM data before or after planning.
-    - If `bom_number` is provided, fetch data for that specific BOM.
-    - If no `bom_number` is provided, fetch the entire table.
-    """
-    try:
-        data = request.get_json()
-        bom_number = data.get("bom_number")  # Optional
-
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        if bom_number:
-            # Fetch specific BOM data
-            cursor.execute("""
-                SELECT * FROM admin_parts WHERE bom_number = %s
-            """, (bom_number,))
-        else:
-            # Fetch entire BOM data
-            cursor.execute("SELECT * FROM admin_parts")
-
-        bom_data = cursor.fetchall()
-        cursor.close()
-
-        if not bom_data:
-            return jsonify({"error": "No data found"}), 404
-
-        # Convert to DataFrame
-        df = pd.DataFrame(bom_data)
-
-        # Create Excel file
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="BOM Data")
-
-        output.seek(0)
-
-        return send_file(output, as_attachment=True, download_name="BOM_Data.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
-
------------------NEW:
-
-@app.route("/download_bom_data", methods=["POST"])
-@jwt_required()
-def download_bom_data():
-    """
-    Downloads the BOM data table with selected columns.
-    Returns a Base64-encoded Excel file.
-    """
-    try:
-        data = request.get_json()
-        bom_number = data.get("bom_number", None)  # Optional
-
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        if bom_number:
-            cursor.execute("""
-                SELECT "Item_code", "On_hand_Qty", "Extended_Quantity"
-                FROM bom_data WHERE bom_number = %s
-            """, (bom_number,))
-        else:
-            cursor.execute("""
-                SELECT "Item_code", "On_hand_Qty", "Extended_Quantity"
-                FROM bom_data
-            """)
-
-        bom_data = cursor.fetchall()
-        cursor.close()
-
-        if not bom_data:
-            return jsonify({"error": "No data found"}), 404
-
-        # Convert to DataFrame
-        df = pd.DataFrame(bom_data)
-
-        # Create Excel file with adjusted column widths
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="BOM Data")
-
-            # ✅ Auto-adjust column widths
-            worksheet = writer.sheets["BOM Data"]
-            for col_num, value in enumerate(df.columns.values):
-                col_width = max(df[value].astype(str).map(len).max(), len(value)) + 2
-                worksheet.set_column(col_num, col_num, col_width)
-
-        output.seek(0)
-
-        # Convert to Base64
-        encoded_string = base64.b64encode(output.getvalue()).decode('utf-8')
-
-        return jsonify({"file_data": encoded_string})
-
-    except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
-
-
-@app.route("/download_planned_inventory", methods=["POST"])
-@jwt_required()
-def download_planned_inventory():
-    """
-    Downloads the planned inventory table for a given BOM number.
-    """
-    try:
-        data = request.get_json()
-        bom_number = data.get("bom_number")
-
-        connection = connect_to_database()
-        if not connection:
-            return jsonify({"error": "Database connection failed"}), 500
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        # 🚀 **1. Fetch planned inventory data**
-        query = """
-            SELECT id, bom_number, "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity"
-            FROM planned_inventory
-        """
-        params = ()
-        if bom_number:
-            query += " WHERE bom_number = %s"
-            params = (bom_number,)
-
-        cursor.execute(query, params)
-        planned_data = cursor.fetchall()
-        cursor.close()
-        connection.close()
-
-        # Convert to DataFrame
-        df_planned = pd.DataFrame(planned_data)
-
-        # 🚀 **2. Compute Allocation & Net_Qty**
-        df_planned["Allocation"] = df_planned["Extended_Quantity"]  # Allocation is the deducted quantity
-        df_planned["Net_Qty"] = df_planned["On_hand_Qty"] - df_planned["Allocation"]  # Net_Qty = On_hand_Qty - Allocation
-
-        # 🚀 **3. Reorder Columns**
-        column_order = ["id", "bom_number", "Item_Level", "Item_code", "On_hand_Qty", "Extended_Quantity", "Allocation", "Net_Qty"]
-        df_planned = df_planned[column_order]
-
-        # 🚀 **4. Create an Excel File**
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_planned.to_excel(writer, sheet_name="Planned Inventory", index=False)
-
-            # Adjust column widths
-            worksheet = writer.sheets["Planned Inventory"]
-            for i, col in enumerate(df_planned.columns):
-                col_width = max(df_planned[col].astype(str).map(len).max(), len(col)) + 2
-                worksheet.set_column(i, i, col_width)
-
-        output.seek(0)
-
-        # 🚀 **5. Convert to Base64**
-        base64_encoded = base64.b64encode(output.read()).decode("utf-8")
-
-        return jsonify({"file_data": base64_encoded})
-
-    except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
 
         
 if __name__ == "__main__":
