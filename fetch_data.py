@@ -87,6 +87,63 @@ def build_bom_tree(bom_data, finished_good_code):
 
     return item_data, tree
 
+# def calculate_max_units(tree, item_data, finished_good_code, required_quantity):
+#     shortages = []  # Track items causing shortages
+#     used_items = {}  # Track only required items for inventory deduction
+
+#     def recursive_calculate(item_code, quantity_needed):
+#         if item_code not in item_data:
+#             shortages.append((item_code, "Unknown"))
+#             return 0
+
+#         item = item_data[item_code]
+#         on_hand_qty = float(item["On_hand_Qty"]) if item["On_hand_Qty"] else 0
+#         required_qty = max(1, float(item["Extended_Quantity"]))  # Prevent division by zero
+#         # make_or_buy = item["Make/Buy"].lower().strip()
+#         make_or_buy = item.get("Make/Buy", "make").lower().strip()
+
+
+#         print(f"Processing '{item_code}' ({make_or_buy.upper()}) - Needed: {quantity_needed}, Available: {on_hand_qty}, Required per unit: {required_qty}")
+
+#         # ✅ BUY items: must have full quantity in stock
+#         if make_or_buy == "buy":
+#             if quantity_needed > on_hand_qty:
+#                 shortages.append((item_code, quantity_needed - on_hand_qty))
+#                 return 0
+
+#             used_items[item_code] = used_items.get(item_code, 0) + quantity_needed
+#             return on_hand_qty // required_qty
+
+#         # ✅ MAKE items: use what's in stock, and try to craft the rest
+#         if on_hand_qty >= quantity_needed:
+#             used_items[item_code] = used_items.get(item_code, 0) + quantity_needed
+#             return on_hand_qty // required_qty
+
+#         remaining_needed = quantity_needed - on_hand_qty
+#         if on_hand_qty > 0:
+#             used_items[item_code] = used_items.get(item_code, 0) + on_hand_qty
+
+#         if item_code in tree:
+#             child_units = []
+#             for child in tree[item_code]:
+#                 child_required = float(item_data[child]["Extended_Quantity"])
+#                 total_child_needed = remaining_needed * child_required
+#                 units = recursive_calculate(child, total_child_needed)
+#                 if units == 0:
+#                     return 0  # Fail if any child fails
+#                 child_units.append(units)
+
+#                 used_items[child] = used_items.get(child, 0) + total_child_needed
+
+#             print(f"Child check for {item_code}: {child_units}")
+#             return min(child_units) if child_units else float("inf")
+
+#         # Leaf MAKE item but not enough stock and no children to produce more
+#         shortages.append((item_code, remaining_needed))
+#         return 0
+
+#     max_units = recursive_calculate(finished_good_code, required_quantity)
+#     return max_units, shortages, used_items
 
 def calculate_max_units(tree, item_data, finished_good_code, required_quantity):
     shortages = []  # Track missing BUY items
@@ -148,5 +205,3 @@ def calculate_max_units(tree, item_data, finished_good_code, required_quantity):
 
     max_units = recursive_calculate(finished_good_code, required_quantity)
     return max_units, shortages, used_items
-
-
